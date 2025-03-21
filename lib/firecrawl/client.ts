@@ -1,10 +1,17 @@
 import { CrawlResult, Vehicle, saveCrawlResultToFile, loadCrawlResults } from './utils';
+import fs from 'fs/promises';
+import path from 'path';
+import FirecrawlApp, { CrawlStatusResponse, ErrorResponse } from '@mendable/firecrawl-js';
 
-// MCP API endpoints
-const MCP_API_BASE = process.env.NEXT_PUBLIC_MCP_API_URL || 'https://mcp.api.example.com';
+// Firecrawl API key from environment
+const FIRECRAWL_API_KEY = process.env.FIRECRAWL_API_KEY || 'fc-75a2b4cc678643d289003da89c947da8';
 
 // Define the configuration structure for a crawl
 export interface CrawlConfig {
+  limit?: number;
+  scrapeOptions?: {
+    formats?: string[];
+  };
   selectors?: {
     vehicleContainer?: string;
     make?: string;
@@ -25,6 +32,74 @@ export interface CrawlConfig {
   };
 }
 
+// Define the response type for the crawlUrl method
+export interface CrawlResponse {
+  success: boolean;
+  message: string;
+  data: CrawlResult;
+}
+
+// FirecrawlApp implementation using the official package
+class FirecrawlClient {
+  private client: FirecrawlApp;
+
+  constructor(config: { apiKey: string }) {
+    this.client = new FirecrawlApp({ apiKey: config.apiKey });
+  }
+
+  /**
+   * Crawl a URL using the Firecrawl service
+   * @param url The URL to crawl
+   * @param options The options for the crawl
+   * @returns The crawl result
+   */
+  async crawlUrl(url: string, options?: any): Promise<any> {
+    console.log(`Crawling URL with Firecrawl: ${url}`);
+
+    try {
+      // Start the crawl job
+      const crawlResponse = await this.client.asyncCrawlUrl(url, {
+        ...options,
+        scrapeOptions: {
+          formats: ["html", "markdown"],
+          ...options?.scrapeOptions
+        }
+      });
+
+      if (!crawlResponse.success || !crawlResponse.id) {
+        throw new Error(`Failed to start crawl: ${crawlResponse.error || 'Unknown error'}`);
+      }
+
+      console.log(`Crawl job started with ID: ${crawlResponse.id}`);
+
+      // Poll for completion
+      let status: CrawlStatusResponse | ErrorResponse;
+      do {
+        // Wait 2 seconds between checks
+        await new Promise(resolve => setTimeout(resolve, 2000));
+        
+        status = await this.client.checkCrawlStatus(crawlResponse.id);
+        
+        if ('error' in status) {
+          throw new Error(`Crawl check failed: ${status.error}`);
+        }
+        
+        console.log(`Crawl status: ${status.status}, completed: ${status.completed}/${status.total}`);
+        
+      } while (status.status === 'scraping');
+
+      if (status.status === 'failed') {
+        throw new Error('Crawl failed');
+      }
+
+      return status;
+    } catch (error) {
+      console.error('Error in Firecrawl crawlUrl:', error);
+      throw error;
+    }
+  }
+}
+
 // The Firecrawl client for interacting with the crawling service
 export const firecrawlClient = {
   /**
@@ -38,22 +113,92 @@ export const firecrawlClient = {
     dealerId: string,
     url: string,
     config: CrawlConfig = {}
-  ): Promise<CrawlResult> {
+  ): Promise<CrawlResponse> {
     console.log(`Crawling ${url} for dealer ${dealerId}`);
 
     try {
-      // In a production environment, this would call the MCP API
-      // For now, we'll simulate a crawl with mock data
-      const result = await this.simulateCrawl(url);
+      // Check if API key is available
+      if (!FIRECRAWL_API_KEY) {
+        throw new Error('Firecrawl API key is not configured. Please check your environment variables.');
+      }
+
+      // Create data directory if it doesn't exist
+      const dataDir = path.join(process.cwd(), 'data', 'crawls');
+      await fs.mkdir(dataDir, { recursive: true });
       
-      // Save the result to a file
-      await saveCrawlResultToFile(dealerId, result);
+      // Initialize the Firecrawl client
+      const client = new FirecrawlClient({ apiKey: FIRECRAWL_API_KEY });
       
-      return {
-        success: true,
-        message: 'Crawl completed successfully',
-        data: result
-      };
+      // Use the Firecrawl API as shown in the example
+      console.log('Making request to Firecrawl API...');
+      
+      try {
+        // Create a crawl configuration based on our config object
+        const crawlOptions = {
+          limit: config.limit || 100,
+          scrapeOptions: {
+            formats: ["html", "markdown"],
+            ...config.scrapeOptions
+          }
+        };
+        
+        // Call the Firecrawl API
+        const apiResult = await client.crawlUrl(url, crawlOptions);
+        console.log('Firecrawl API response received');
+        
+        // Transform to our internal format
+        const vehicles: Vehicle[] = [];
+        
+        // Process the crawl result based on the structure returned by Firecrawl
+        if (apiResult.data && Array.isArray(apiResult.data)) {
+          apiResult.data.forEach((doc: any) => {
+            try {
+              // Extract vehicle data from the HTML/markdown content
+              // This is a simplified example - you'll need to adjust based on the actual structure
+              const vehicle: Vehicle = {
+                make: doc.extract?.make || 'Unknown',
+                model: doc.extract?.model || 'Unknown',
+                year: parseInt(doc.extract?.year) || 0,
+                price: parseFloat(doc.extract?.price?.replace(/[$,]/g, '')) || 0,
+                mileage: parseInt(doc.extract?.mileage?.replace(/[,]/g, '')) || 0,
+                vin: doc.extract?.vin || '',
+                imageUrl: doc.extract?.imageUrl || '',
+                url: doc.url || ''
+              };
+              vehicles.push(vehicle);
+            } catch (error) {
+              console.error('Error processing vehicle data:', error);
+            }
+          });
+        }
+        
+        const result: CrawlResult = {
+          vehicles,
+          metadata: {
+            dealerName: '',  // We'll need to extract this from the page if needed
+            totalFound: vehicles.length,
+            website: url,
+            crawlDate: new Date().toISOString(),
+            crawlDuration: 0  // This information might not be available
+          }
+        };
+        
+        // Save to a file
+        await this.saveResultToFile(dealerId, result);
+        
+        return {
+          success: true,
+          message: 'Crawl completed successfully',
+          data: result
+        };
+      } catch (fetchError: unknown) {
+        // Handle specific fetch errors
+        if (fetchError instanceof Error) {
+          throw fetchError;
+        } else {
+          throw new Error(`Unknown error connecting to Firecrawl API: ${String(fetchError)}`);
+        }
+      }
     } catch (error) {
       console.error('Error crawling URL:', error);
       return {
@@ -63,142 +208,79 @@ export const firecrawlClient = {
       };
     }
   },
+  
+  /**
+   * Save crawl results to a file using the dealer name
+   * @param dealerId The dealer ID
+   * @param result The crawl result to save
+   */
+  async saveResultToFile(dealerId: string, result: CrawlResult): Promise<string> {
+    try {
+      // Create directory structure if it doesn't exist
+      const dir = path.join(process.cwd(), 'data', 'crawls');
+      await fs.mkdir(dir, { recursive: true });
+      
+      // Create a filename with dealerId and timestamp
+      const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+      const filename = `dealer-${dealerId}-${timestamp}.json`;
+      const filepath = path.join(dir, filename);
+      
+      // Write the data to the file
+      await fs.writeFile(
+        filepath,
+        JSON.stringify(result, null, 2)
+      );
+      
+      console.log(`Saved crawl result to ${filepath}`);
+      return filepath;
+    } catch (error) {
+      console.error('Error saving crawl result to file:', error);
+      throw error;
+    }
+  },
 
   /**
    * Get all crawl results for a dealer
    * @param dealerId The dealer ID
    * @returns A promise that resolves to an array of crawl results
    */
-  async getDealerCrawlResults(dealerId: string): Promise<CrawlResult[]> {
+  async getDealerCrawlResults(dealerId: string): Promise<CrawlResponse[]> {
     try {
-      const results = await loadCrawlResults(dealerId);
-      return results.map(result => ({
-        success: true,
-        message: 'Retrieved from storage',
-        data: result
-      }));
+      const dir = path.join(process.cwd(), 'data', 'crawls');
+      
+      // Create directory if it doesn't exist
+      await fs.mkdir(dir, { recursive: true });
+      
+      // Get all files in the directory
+      const files = await fs.readdir(dir);
+      
+      // Filter for files matching this dealer ID
+      const dealerFiles = files.filter(file => file.includes(`dealer-${dealerId}`));
+      
+      // Read and parse each file
+      const results = await Promise.all(
+        dealerFiles.map(async (file) => {
+          const filePath = path.join(dir, file);
+          const data = await fs.readFile(filePath, 'utf-8');
+          try {
+            const result = JSON.parse(data) as CrawlResult;
+            return {
+              success: true,
+              message: 'Retrieved from file storage',
+              data: result
+            };
+          } catch (error) {
+            console.error(`Error parsing file ${file}:`, error);
+            return null;
+          }
+        })
+      );
+      
+      // Filter out any null results
+      return results.filter((result): result is CrawlResponse => result !== null);
     } catch (error) {
       console.error('Error loading crawl results:', error);
       return [];
-    }
-  },
-
-  /**
-   * Simulate a crawl with mock data (for development)
-   * @param url The URL to simulate crawling
-   * @returns A promise that resolves to the simulated crawl result
-   */
-  async simulateCrawl(url: string): Promise<{ vehicles: Vehicle[] }> {
-    // Sleep for a random amount of time to simulate a real crawl
-    await new Promise(resolve => setTimeout(resolve, 1000 + Math.random() * 2000));
-    
-    // Return different mock data based on the URL to simulate different dealers
-    if (url.includes('carsforsale')) {
-      return {
-        vehicles: [
-          {
-            make: 'Toyota',
-            model: 'Camry',
-            year: 2020,
-            price: 22500,
-            mileage: 25000,
-            vin: 'JT2BF22K1W0123456',
-            imageUrl: 'https://via.placeholder.com/800x600/blue',
-            url: `${url}/vehicles/toyota-camry`
-          },
-          {
-            make: 'Honda',
-            model: 'Accord',
-            year: 2019,
-            price: 20800,
-            mileage: 32000,
-            vin: 'JH4KA7660PC003448',
-            imageUrl: 'https://via.placeholder.com/800x600/red',
-            url: `${url}/vehicles/honda-accord`
-          },
-          {
-            make: 'Ford',
-            model: 'F-150',
-            year: 2021,
-            price: 38900,
-            mileage: 15000,
-            vin: '1FTFW1ET5EFC12345',
-            imageUrl: 'https://via.placeholder.com/800x600/silver',
-            url: `${url}/vehicles/ford-f150`
-          }
-        ]
-      };
-    } else if (url.includes('autotrader')) {
-      return {
-        vehicles: [
-          {
-            make: 'BMW',
-            model: 'X5',
-            year: 2020,
-            price: 55000,
-            mileage: 22000,
-            vin: 'WBAKJ4C51BC429751',
-            imageUrl: 'https://via.placeholder.com/800x600/black',
-            url: `${url}/vehicles/bmw-x5`
-          },
-          {
-            make: 'Mercedes-Benz',
-            model: 'C-Class',
-            year: 2021,
-            price: 45800,
-            mileage: 18000,
-            vin: 'WDDWJ4KB7KF788052',
-            imageUrl: 'https://via.placeholder.com/800x600/silver',
-            url: `${url}/vehicles/mercedes-c-class`
-          }
-        ]
-      };
-    } else {
-      // Generic dealer
-      return {
-        vehicles: [
-          {
-            make: 'Chevrolet',
-            model: 'Silverado',
-            year: 2022,
-            price: 42000,
-            mileage: 8000,
-            vin: '1GCUKREC0JF204616',
-            imageUrl: 'https://via.placeholder.com/800x600/gray',
-            url: `${url}/vehicles/chevrolet-silverado`
-          },
-          {
-            make: 'Nissan',
-            model: 'Altima',
-            year: 2020,
-            price: 19500,
-            mileage: 28000,
-            vin: '1N4AL3AP8FC123456',
-            imageUrl: 'https://via.placeholder.com/800x600/white',
-            url: `${url}/vehicles/nissan-altima`
-          },
-          {
-            make: 'Jeep',
-            model: 'Grand Cherokee',
-            year: 2021,
-            price: 37800,
-            mileage: 17000,
-            vin: '1C4RJFBG4MC123456',
-            imageUrl: 'https://via.placeholder.com/800x600/green',
-            url: `${url}/vehicles/jeep-grand-cherokee`
-          },
-          {
-            make: 'Tesla',
-            model: 'Model 3',
-            year: 2022,
-            price: 48900,
-            mileage: 5000,
-            vin: '5YJ3E1EA8MF123456',
-            imageUrl: 'https://via.placeholder.com/800x600/red',
-            url: `${url}/vehicles/tesla-model-3`
-          }
-        ]
-      };
     }
   }
 }; 
